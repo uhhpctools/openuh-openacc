@@ -1,0 +1,559 @@
+#!@BASH_PATH@
+
+#  CAF launcher wrapper for OpenUH compiler
+#
+#  Copyright (C) 2010-2013 University of Houston.
+#
+#  This program is free software; you can redistribute it and/or modify it
+#  under the terms of version 2 of the GNU General Public License as
+#  published by the Free Software Foundation.
+#
+#  This program is distributed in the hope that it would be useful, but
+#  WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+#  Further, this software is distributed without any warranty that it is
+#  free of the rightful claim of any third person regarding infringement
+#  or the like.  Any license provided herein, whether implied or
+#  otherwise, applies only to this software file.  Patent licenses, if
+#  any, provided herein do not apply to combinations of this program with
+#  other software, or any other product whatsoever.
+#
+#  You should have received a copy of the GNU General Public License along
+#  with this program; if not, write the Free Software Foundation, Inc., 59
+#  Temple Place - Suite 330, Boston MA 02111-1307, USA.
+#
+#  Contact information:
+#  http://www.cs.uh.edu/~hpctools
+#
+#
+
+this="`basename $0`"
+
+default_heap_size=@DEFAULT_CAF_HEAP_SIZE@
+
+version_num=@OPENUH_VERSION@
+
+GASNET_HOME=@GASNET_HOME@
+ARMCI_HOME=@ARMCI_HOME@
+default_comm=@DEFAULT_COMM@
+
+
+ENVIRONMENT="-----------------------\n"
+
+this_usage_short()
+{
+  cat <<_EOT_
+
+Usage: $this  [OPTIONS]... PROGRAM... -- [LAUNCHER OPTIONS]...
+
+For cafrun options, do:
+   cafrun --help
+
+For options specific to underlying launcher, do:
+   cafrun --help2
+
+_EOT_
+
+}
+
+print_version_info()
+{
+  echo " cafrun: $version_num"
+  echo ""
+  echo " Script for running CAF programs compiled with OpenUH"
+  echo " Copyright (C) University of Houston"
+  echo ""
+}
+
+this_usage_env()
+{
+  cat <<_EOT_
+
+Environment Variables:
+
+   UHCAF_LAUNCHER     Underlying launcher to use for the specified program
+
+   UHCAF_LAUNCHER_OPTS
+                      Additional options to pass to underlying launcher
+
+   UHCAF_IMAGE_NUM_IMAGES
+                      Specifies number of images to launch.
+                         Can be set/overridden with --num-images
+
+   UHCAF_IMAGE_HEAP_SIZE
+                      Specifies heap size per image for storing coarray data.
+                         Can be set with --image-heap
+
+   UHCAF_TRACE        Specifies trace levels for runtime.
+                         Can be set with --trace
+
+   UHCAF_TRACE_DIR    Specifies dir to store runtime traces
+                         Can be set with --trace-dir
+
+   UHCAF_PROGRESS_THREAD
+                      Set to 1 to enable progress thread in CAF runtime
+
+   UHCAF_PROGRESS_THREAD_INTERVAL
+                      Set the time interval (ns) between AM serving by progress
+                      thread.
+
+   UHCAF_GETCACHE
+                      Set to 1 to enable getcache runtime optimization.
+
+   UHCAF_GETCACHE_LINE_SIZE
+                      Specifies the size (in bytes) of the cache line used by
+                      getcache optimizer. By default it is 64KB.
+
+   UHCAF_NB_XFER_LIMIT
+                      Specifies the maximum number of outstanding non-blocking
+                      PUT or GET transfers. By default it is 16.
+
+_EOT_
+}
+
+this_usage()
+{
+  cat <<_EOT_
+
+Usage: $this  [OPTIONS]... PROGRAM... -- [LAUNCHER OPTIONS]...
+
+Where OPTIONS are:
+
+  --num-images=N
+  -n,-np N            N is number of images to use
+
+  --image-heap=I      I is heap size per image for storing coarray data. It
+                      may be an integer which indicates size in bytes, or it
+                      may have the suffixes K, M, G which indicates size in
+                      kilobytes, megabytes, and gigabytes, respectively.
+
+  --trace=L           Sets trace levels for runtime.
+                      L=all or trace levels delimited by ':'.
+                        Available trace levels:
+                        FATAL:DEBUG:TIME:NOTICE:TIME_SUMMARY:INIT:EXIT:
+                        COMM:MEMORY:CACHE:SYNC:COLLECTIVE:SERVICE:MEMORY_SUMMARY
+
+  --trace-dir=D       D is name of directory to store traces
+
+  --verbose,-v        Verbose output
+
+  --show              Display launch settings and command, but does not run
+                      program
+
+  --help              Prints this menu and exits
+
+  --help2             Prints underlying LAUNCHER OPTIONS and exits
+
+  --help-env          Prints available environment variables for controlling
+                      runtime environment and exits
+
+  --version,-V        Print version of cafrun and exits
+
+_EOT_
+
+}
+
+launcher_usage()
+{
+  if [ -n "$UHCAF_LAUNCHER" ]; then
+      eval "$UHCAF_LAUNCHER --help"
+  else
+      echo "No separate launcher program is used for the executable $prog_name"
+  fi
+}
+
+add_to_env_list()
+{
+  var=$1
+  val=$(eval "echo \"\$$1\"")
+  ENVIRONMENT+="  $var: $val\n"
+}
+
+set_env()
+{
+  var=$1
+  shift
+  val="$*"
+
+  cmd="$var=\"$val\"; export $var"
+  eval $cmd
+
+  add_to_env_list $var $val
+}
+
+print_error()
+{
+  echo -e "Error: $*" >&2
+  exit 1
+}
+
+print_warning()
+{
+  echo -e "Warning: $*" >&2
+}
+
+
+# -------------------------------------------------------------------
+
+# default launcher for gasnet-built programs
+gasnet_launcher=`which mpirun 2> /dev/null`
+if [ -f $GASNET_HOME/bin/gasnetrun_mpi ]; then
+   eval `grep MPIRUN_CMD= $GASNET_HOME/bin/gasnetrun_mpi`
+   gasnet_launcher=${MPIRUN_CMD%% *}
+fi
+
+#default launcher for armci-built programs
+armci_launcher=`which mpirun 2> /dev/null`
+
+############################################################
+# set default launcher if its not already set
+if [ -z "$UHCAF_LAUNCHER" ]; then
+  # find a suitable, default launcher
+  if [ "$default_comm" = "gasnet" ]; then
+    UHCAF_LAUNCHER=$gasnet_launcher
+  else
+    UHCAF_LAUNCHER=$armci_launcher
+  fi
+fi
+
+if [ $# -eq 0 ]; then
+  this_usage_short
+  exit 1
+fi
+
+verbose=no
+show=no
+shared=no
+num_images=
+all_args=("$@")
+arg_num=0
+option_parse=yes
+display_help=no
+display_help2=no
+program_name_seen=no
+
+process_num_images=no
+for arg in "$@" ; do
+  pass_arg=no
+  if [ $option_parse = no ]; then
+      pass_arg=yes
+  fi
+
+  if [ $process_num_images = yes ]; then
+      if ! [[ "$arg" =~ ^[0-9]+$ ]]; then
+        print_error "num-images specified is not valid"
+      fi
+      num_images=$arg
+      unset all_args[$arg_num]
+      arg_num=$((arg_num+1))
+      process_num_images=no
+      continue
+  fi
+
+  if [ $program_name_seen = no ]; then
+
+    case "$arg" in
+      -v|--verbose)
+        verbose=yes
+        ;;
+      -V|--version)
+        print_version_info
+        exit 0
+        ;;
+      --show)
+        verbose=yes
+        show=yes
+        ;;
+      --help)
+        this_usage
+        exit 0
+        ;;
+      --help2)
+        display_help2=yes
+        ;;
+      --help-env)
+        this_usage_env
+        exit 0
+        ;;
+      --num-images=*)
+        num_images=`echo UhCaf$arg | sed -e 's/UhCaf--num-images=//g'`
+        if ! [[ "$num_images" =~ ^[0-9]+$ ]]; then
+          print_error "num-images specified is not valid"
+        fi
+        ;;
+      -n|-np)
+        # next arg should be number of images
+        process_num_images=yes
+        ;;
+      --trace=*)
+        levels=`echo UhCaf$arg | sed -e 's/UhCaf--trace=//g'`
+        levels=`echo $levels | tr '[:lower:]' '[:upper:]'`
+        set_env UHCAF_TRACE $levels
+        ;;
+      --trace-dir=*)
+        trace_dir=`echo UhCaf$arg | sed -e 's/UhCaf--trace-dir=//g'`
+        set_env UHCAF_TRACE_DIR $trace_dir
+        ;;
+      --image-heap=*)
+        image_heap=`echo UhCaf$arg | sed -e 's/UhCaf--image-heap=//g'`
+
+        if [[ ! $image_heap =~ ^[0-9]+$ ]]; then
+          if [[  $image_heap =~ ^[0-9]+[kK]$ ]]; then
+            image_heap=$((${image_heap%?}*1024))
+          elif [[ $image_heap =~ ^[0-9]+[mM]$ ]]; then
+            image_heap=$((${image_heap%?}*1024*1024))
+          elif [[ $image_heap =~ ^[0-9]+[gG]$ ]]; then
+            image_heap=$((${image_heap%?}*1024*1024*1024))
+          else
+            print_error "Invalid per-image heap size: $image_heap"
+          fi
+        fi
+        ;;
+      -*)
+        echo "" >&2
+        echo "   Unrecognized option: $arg" >&2
+        echo "" >&2
+        this_usage
+        exit 1
+        ;;
+      *)
+        if [ $option_parse = yes ]; then
+            program_cmd+="$arg "
+        fi
+        program_name_seen=yes
+        ;;
+    esac
+
+  else # $program_name = yes
+
+      case "$arg" in
+        --)
+          option_parse=no
+          ;;
+        *)
+          if [ $option_parse = yes ]; then
+              program_cmd+="$arg "
+          fi
+          ;;
+      esac
+
+  fi
+
+  if [ $pass_arg = no ]; then
+      unset all_args[$arg_num]
+  fi
+  arg_num=$((arg_num+1))
+
+done
+
+all_args=${all_args[@]}
+
+prog_name=`echo ${program_cmd%% *}`
+prog_args=`echo ${program_cmd#$prog_name}`
+if [ -z "$prog_name" ]; then
+    if [ $display_help2 = yes ]; then
+        if [ -n "$UHCAF_LAUNCHER"  ]; then
+            print_warning "Guessing that the launcher is $UHCAF_LAUNCHER"
+            launcher_usage
+        else
+            print_error "Don't know what launcher to use."
+        fi
+        exit 0
+    fi
+    this_usage
+    exit 0
+fi
+
+###########################################
+# determine which communication layer to use
+
+if [ -z "$prog_name" ]; then
+    echo "Need to specify the program you want to run." >&2
+    this_usage_short
+    exit 1
+elif [ ! -f "$prog_name" ]; then
+    echo "cafrun was unable find the executable $prog_name." >&2
+    this_usage_short
+    exit 1
+fi
+
+COMM_LAYER=`nm $prog_name 2> /dev/null | grep OPENUH_COMM_LAYER_IS | cut -d" " -f3 \
+  | sed 's/OPENUH_COMM_LAYER_IS_//'`
+
+if [ -z "$COMM_LAYER" ]; then
+    print_error "Error inspecting executable $prog_name for launch information"
+fi
+
+GASNET_CONDUIT=""
+if [ $COMM_LAYER == gasnet ]; then
+  GASNET_CONDUIT=`nm -a $prog_name | grep OPENUH_GASNET_CONDUIT_IS | cut -d" " -f3 \
+    | sed 's/OPENUH_GASNET_CONDUIT_IS_//'`
+
+  if [ -z "$GASNET_CONDUIT" ]; then
+    print_error "Cannot determine which GASNet conduit ot use"
+  fi
+  UHCAF_LAUNCHER=$gasnet_launcher
+fi
+
+if [ $COMM_LAYER == armci ]; then
+# ARMCI_NETWORK variable is obsolete in latest ARMCI version
+
+#   ARMCI_NETWORK=`nm -a $prog_name | grep OPENUH_ARMCI_NETWORK_IS | cut -d" " -f3 \
+#     | sed 's/OPENUH_ARMCI_NETWORK_IS_//'`
+#
+#   if [ -z "$ARMCI_NETWORK" ]; then
+#     print_error "Cannot determine which ARMCI network to use"
+#   fi
+  ARMCI_NETWORK=unknown
+  UHCAF_LAUNCHER=$armci_launcher
+fi
+
+###########################################
+# display help menu and exit, if necessary
+if [ $display_help2 = yes ]; then
+    if [ "$GASNET_CONDUIT" = "smp" ]; then
+        # no launcher used for GASNet's SMP conduit
+        unset UHCAF_LAUNCHER
+    fi
+    launcher_usage
+    exit 0
+fi
+
+
+###########################################
+# set heap size in environment
+if [ -n "$image_heap" ]; then
+  set_env UHCAF_IMAGE_HEAP_SIZE $image_heap
+elif [ -n "$UHCAF_IMAGE_HEAP_SIZE" ]; then
+  image_heap=$UHCAF_IMAGE_HEAP_SIZE
+  if [[ ! $image_heap =~ ^[0-9]+$ ]]; then
+    if [[  $image_heap =~ ^[0-9]+[kK]$ ]]; then
+      image_heap=$((${image_heap%?}*1024))
+    elif [[ $image_heap =~ ^[0-9]+[mM]$ ]]; then
+      image_heap=$((${image_heap%?}*1024*1024))
+    elif [[ $image_heap =~ ^[0-9]+[gG]$ ]]; then
+      image_heap=$((${image_heap%?}*1024*1024*1024))
+    else
+      print_error "Invalid per-image heap size: $image_heap"
+    fi
+  fi
+  set_env UHCAF_IMAGE_HEAP_SIZE $image_heap
+else
+  image_heap=$default_heap_size
+  if [[ ! $image_heap =~ ^[0-9]+$ ]]; then
+    if [[  $image_heap =~ ^[0-9]+[kK]$ ]]; then
+      image_heap=$((${image_heap%?}*1024))
+    elif [[ $image_heap =~ ^[0-9]+[mM]$ ]]; then
+      image_heap=$((${image_heap%?}*1024*1024))
+    elif [[ $image_heap =~ ^[0-9]+[gG]$ ]]; then
+      image_heap=$((${image_heap%?}*1024*1024*1024))
+    else
+      print_error "Invalid per-image heap size: $image_heap"
+    fi
+  fi
+  set_env UHCAF_IMAGE_HEAP_SIZE $image_heap
+fi
+
+###########################################
+# set number of images in environment
+if [ -n "$num_images" ]; then
+  set_env UHCAF_NUM_IMAGES $num_images
+elif [ -n "$UHCAF_NUM_IMAGES" ]; then
+  add_to_env_list UHCAF_NUM_IMAGES
+  num_images=$UHCAF_NUM_IMAGES
+else
+  set_env UHCAF_NUM_IMAGES 1
+  num_images=1
+fi
+
+###########################################
+# set launcher information
+UHCAF_LAUNCHER_OPTS+=$all_args
+
+COMM_NETWORK=""
+
+###########################################
+# Set environment for GASNET/ARMCI
+if [ $COMM_LAYER == gasnet ]; then
+  # enable packing of non-contiguous put/get
+  set_env GASNET_VIS_AMPIPE 1
+
+  # CAF runtime will set this variable to a sufficient value
+  unset GASNET_MAX_SEGSIZE
+
+  COMM_NETWORK=$GASNET_CONDUIT
+elif [ $COMM_LAYER == armci ]; then
+  COMM_NETWORK=$ARMCI_NETWORK
+fi
+
+
+if [ "$GASNET_CONDUIT" = "smp" ]; then
+  set_env GASNET_PSHM_NODES $num_images
+  command="$program_cmd"  # just throw away $all_args?
+else
+
+  if [ -z "`which $UHCAF_LAUNCHER 2> /dev/null`" ]; then
+    print_error "Could not locate a launcher program. Specify with UHCAF_LAUNCHER variable"
+  fi
+
+  add_to_env_list "UHCAF_LAUNCHER"
+
+  launcher_name=`basename $UHCAF_LAUNCHER`
+
+  if [ \( $launcher_name = mpirun -o $launcher_name = mpiexec -o \
+          $launcher_name = aprun \) ]; then
+    if [ $num_images -gt 1 ]; then
+      UHCAF_LAUNCHER_OPTS=" -n $num_images $UHCAF_LAUNCHER_OPTS"
+    else
+      UHCAF_LAUNCHER_OPTS=" -n 1 $UHCAF_LAUNCHER_OPTS"
+    fi
+  fi
+
+  add_to_env_list "UHCAF_LAUNCHER_OPTS"
+
+  if [ "$GASNET_CONDUIT" = "udp" ]; then
+    set_env GASNET_SPAWNFN "C"
+    set_env GASNET_CSPAWN_CMD "$UHCAF_LAUNCHER $UHCAF_LAUNCHER_OPTS -n %N %C"
+    command="$prog_name $num_images $prog_args"
+  else
+    # rest of gasnet conduits and armci layer
+    command="$UHCAF_LAUNCHER $UHCAF_LAUNCHER_OPTS $program_cmd"
+  fi
+
+fi
+
+# if traces specified, then create directory for traces.
+if [ -n "$UHCAF_TRACE" ]; then
+    if [ -n "$UHCAF_TRACE_DIR" -a ! -d "$UHCAF_TRACE_DIR" ]; then
+        mkdir $UHCAF_TRACE_DIR
+    elif [ ! -d "uhcaf.traces" ]; then
+        mkdir uhcaf.traces
+    fi
+fi
+
+ENVIRONMENT+="-----------------------\n"
+case $verbose in
+  yes)
+    layer=`echo $COMM_LAYER | tr '[:lower:]' '[:upper:]'`
+    network=`echo $COMM_NETWORK | tr '[:upper:]' '[:lower:]'`
+    echo "" >&2
+    echo "program: $prog_name" >&2
+    echo "layer: $layer" >&2
+    echo "network: $network" >&2
+    echo "" >&2
+    echo "$this environment:" >&2
+    echo -e "$ENVIRONMENT" >&2
+    echo "" >&2
+    echo "command: $command" >&2
+    echo "" >&2
+    ;;
+  *)
+    ;;
+esac
+
+###########################################
+# exeute command to launch program
+if [ $show = no ]; then
+    eval $command
+fi
